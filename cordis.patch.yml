@@ -1,0 +1,14 @@
+# dsh-worktree-flow patch layer.
+#
+# Applied after the profile's shipped bundle layers (dsh-base, ...). One row:
+# the host plugin that registers the /worktree command family and the
+# worktree-flow service.
+#
+# Activation in a profile (same as community plugins):
+#   dsh plugin --profile web add <path-to-this-package>
+# The host reads this file from the package's dsh.bundle.patch and applies it
+# automatically — no manual copying into the profile's cordis.patch.yml.
+
+- insert:
+    - id: worktree-flow
+      name: 'dsh-worktree-flow'

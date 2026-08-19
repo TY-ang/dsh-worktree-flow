@@ -1,0 +1,44 @@
+{
+  "name": "dsh-worktree-flow",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Multi-repository feature worktree orchestration for DeepSeek Harness: create grouped git worktrees and register the feature root as a DSH workspace so every session can pick it at creation.",
+  "type": "module",
+  "license": "MIT",
+  "keywords": [
+    "dsh-plugin",
+    "deepseek-harness",
+    "git-worktree",
+    "multi-repository",
+    "feature-workspace"
+  ],
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "cordis.patch.yml",
+    "README.md",
+    "README.zh.md"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-slots"
+      ]
+    }
+  },
+  "scripts": {
+    "test": "node --test test/core.test.mjs test/config-manifest.test.mjs test/integration.test.mjs && node test/load-test.mjs && node scripts/client-sim.mjs"
+  }
+}
