@@ -20,7 +20,7 @@ Three layers make "wrong branch" physically impossible:
 
 ```powershell
 dsh plugin --profile web add github:TY-ang/dsh-worktree-flow
-# pin a release:  dsh plugin --profile web add github:TY-ang/dsh-worktree-flow#v0.1.0
+# pin a release:  dsh plugin --profile web add github:TY-ang/dsh-worktree-flow#v0.1.1
 # the package declares dsh.bundle, so it joins the profile layer stack automatically
 ```
 

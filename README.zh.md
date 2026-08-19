@@ -20,7 +20,7 @@ DSH（DeepSeek Harness）的**多仓库功能工作区**插件：一个功能/�
 
 ```powershell
 dsh plugin --profile web add github:TY-ang/dsh-worktree-flow
-# 锁定版本：  dsh plugin --profile web add github:TY-ang/dsh-worktree-flow#v0.1.0
+# 锁定版本：  dsh plugin --profile web add github:TY-ang/dsh-worktree-flow#v0.1.1
 # 包声明了 dsh.bundle，会自动进入 profile 层级栈
 ```
 
