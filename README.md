@@ -19,7 +19,8 @@ Three layers make "wrong branch" physically impossible:
 ## Install
 
 ```powershell
-dsh plugin --profile web add <this-repo-path>
+dsh plugin --profile web add github:TY-ang/dsh-worktree-flow
+# pin a release:  dsh plugin --profile web add github:TY-ang/dsh-worktree-flow#v0.1.0
 # the package declares dsh.bundle, so it joins the profile layer stack automatically
 ```
 
