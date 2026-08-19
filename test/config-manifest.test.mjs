@@ -22,6 +22,14 @@ import {
 	writeConfigTemplate
 } from "../lib/config.js";
 import { MANIFEST_NAME, LEGACY_MANIFEST_NAME, readManifest, scanManifests, validateManifest, writeManifest } from "../lib/manifest.js";
+import {
+	createDocsSnapshot,
+	deleteFeatureContext,
+	normalizeSessionInstructions,
+	readFeatureContext,
+	removeDocsSnapshot,
+	writeFeatureContext
+} from "../lib/feature-context.js";
 
 async function scratch() {
 	return fs.promises.mkdtemp(path.join(os.tmpdir(), "dsh-wf-cfg-"));
@@ -81,6 +89,8 @@ test("saveSet → loadSet → listSets round trip; template never consulted", as
 		label: "演示",
 		worktreeRoot: "D:/wt",
 		defaultBaseBranch: "master",
+		sharedDocsPath: dir,
+		projectInstructions: "  项目 SQL 统一放在 db/sql。\r\n提交前检查迁移脚本。  ",
 		repositories: { backend: { label: "后端", path: dir } }
 	});
 	assert.equal(file, setFile("demo"));
@@ -90,6 +100,8 @@ test("saveSet → loadSet → listSets round trip; template never consulted", as
 	assert.equal(loaded?.label, "演示");
 	assert.equal(loaded?.worktreeRoot, "D:/wt");
 	assert.equal(loaded?.defaultBaseBranch, "master");
+	assert.equal(loaded?.sharedDocsPath, dir);
+	assert.equal(loaded?.projectInstructions, "项目 SQL 统一放在 db/sql。\n提交前检查迁移脚本。");
 	assert.equal(loaded?.repositories.backend.label, "后端");
 	assert.equal(loaded?.repositories.shared, undefined, "template vocabulary never merges into a saved set");
 
@@ -104,6 +116,10 @@ test("saveSet/loadSet reject invalid names; deleteSet removes only the file", as
 	useHome(t, path.join(dir, "dsh-home"));
 
 	await assert.rejects(() => saveSet({ name: "Bad Name!", worktreeRoot: "D:/wt", defaultBaseBranch: "master", repositories: {} }), /仓库组名无效/u);
+	await assert.rejects(
+		() => saveSet({ name: "bad-prompt", worktreeRoot: "D:/wt", defaultBaseBranch: "master", projectInstructions: "unsafe\u0000prompt", repositories: {} }),
+		/项目提示词无效/u
+	);
 	await assert.rejects(() => loadSet("../escape"), /仓库组名无效/u);
 
 	await saveSet({ name: "gone", worktreeRoot: "D:/wt", defaultBaseBranch: "master", repositories: {} });
@@ -149,11 +165,15 @@ test("config template: write → read round trip (prefill-only store)", async (t
 	await writeConfigTemplate({
 		worktreeRoot: "~/wt",
 		defaultBaseBranch: "main",
+		sharedDocsPath: "~/project-docs",
 		repositories: { backend: { label: "后端" }, frontend: { defaultBaseBranch: "dev" } }
 	});
 	const template = await readConfigTemplate();
 	assert.equal(template?.worktreeRoot, path.join(os.homedir(), "wt"), "read expands ~ for immediate use as prefill");
 	assert.equal(template?.defaultBaseBranch, "main");
+	assert.equal(template?.sharedDocsPath, undefined, "project-specific docs are not part of the global new-set template");
+	const templateFile = JSON.parse(await fs.promises.readFile(path.join(process.env.DSH_HOME, "worktree-flow.json"), "utf8"));
+	assert.equal(Object.hasOwn(templateFile, "sharedDocsPath"), false, "saving the template drops legacy sharedDocsPath values");
 	assert.equal(template?.repositories.backend.label, "后端");
 	assert.equal(template?.repositories.frontend.defaultBaseBranch, "dev");
 });

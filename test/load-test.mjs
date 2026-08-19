@@ -8,9 +8,10 @@
  *
  * Run: node test/load-test.mjs
  */
-import { mkdtempSync, mkdirSync, writeFileSync, existsSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { docsSnapshotPath, writeFeatureContext } from "../lib/feature-context.js";
 
 const commands = new Map();
 const spawned = [];
@@ -56,9 +57,9 @@ const fakeRegistry = {
 };
 
 /** Canned git answers keyed by argv shape. */
-function answerGit(argv) {
+function answerGit(argv, cwd) {
 	const joined = argv.join(" ");
-	if (joined === "git rev-parse --show-toplevel") return { exitCode: 0, stdout: repoRoot };
+	if (joined === "git rev-parse --show-toplevel") return { exitCode: 0, stdout: cwd };
 	if (joined === "git rev-parse --git-common-dir") return { exitCode: 0, stdout: join(repoRoot, ".git") };
 	if (joined === "git worktree list --porcelain") return { exitCode: 0, stdout: `worktree ${repoRoot}\nHEAD 0123456789012345678901234567890123456789\nbranch refs/heads/master\n` };
 	if (joined === `git show-ref --verify --quiet refs/heads/master`) return { exitCode: 0, stdout: "" };
@@ -76,7 +77,7 @@ const ctx = {
 	subprocess: {
 		spawn(spec) {
 			spawned.push(spec);
-			const answer = answerGit(spec.argv);
+			const answer = answerGit(spec.argv, spec.cwd);
 			return {
 				done: Promise.resolve({ exitCode: answer.exitCode, signal: undefined }),
 				collected: {
@@ -241,6 +242,20 @@ check("POST /branch-types normalizes and persists", typesWrite.status === 200 &&
 const configRes = fakeRes();
 await httpRoutes.get("/worktree-flow/config").handler(fakeReq("GET", "/worktree-flow/config?set=demo"), configRes);
 check("GET /config?set returns the set config", configRes.status === 200 && configRes.json().ok === true && configRes.json().config.name === "demo" && configRes.json().config.repositories.backend.path === repoRoot, configRes.body);
+const sharedDocsRoot = join(fixture, "shared-docs");
+mkdirSync(sharedDocsRoot, { recursive: true });
+writeFileSync(join(sharedDocsRoot, "guide.md"), "guide\n");
+const configWrite = fakeRes();
+await httpRoutes.get("/worktree-flow/config").handler(fakeReq("POST", "/worktree-flow/config", {
+	set: "demo",
+	config: { ...configRes.json().config, sharedDocsPath: sharedDocsRoot, projectInstructions: "项目统一使用 UTC 时间，并先阅读共享 docs。" },
+	revision: configRes.json().revision
+}), configWrite);
+check("POST /config persists sharedDocsPath", configWrite.status === 200, configWrite.body);
+const configWithDocs = fakeRes();
+await httpRoutes.get("/worktree-flow/config").handler(fakeReq("GET", "/worktree-flow/config?set=demo"), configWithDocs);
+check("GET /config round-trips sharedDocsPath", configWithDocs.json().config.sharedDocsPath === sharedDocsRoot, configWithDocs.body);
+check("GET /config round-trips project instructions", configWithDocs.json().config.projectInstructions === "项目统一使用 UTC 时间，并先阅读共享 docs。", configWithDocs.body);
 
 const locateHit = fakeRes();
 await httpRoutes.get("/worktree-flow/locate").handler(fakeReq("GET", `/worktree-flow/locate?cwd=${encodeURIComponent(join(worktreeRoot, "demo", "selection-v2", "backend"))}`), locateHit);
@@ -252,10 +267,18 @@ check("GET /locate returns found:false outside any feature", locateMiss.status =
 const templateRes = fakeRes();
 await httpRoutes.get("/worktree-flow/template").handler(fakeReq("GET", "/worktree-flow/template"), templateRes);
 check("GET /template returns JSON contract", templateRes.status === 200 && templateRes.json().ok === true && Object.hasOwn(templateRes.json(), "configured"), templateRes.body);
+const templateWrite = fakeRes();
+await httpRoutes.get("/worktree-flow/template").handler(fakeReq("POST", "/worktree-flow/template", {
+	config: { worktreeRoot, defaultBaseBranch: "master", sharedDocsPath: sharedDocsRoot, repositories: {} }
+}), templateWrite);
+const templateAfterWrite = fakeRes();
+await httpRoutes.get("/worktree-flow/template").handler(fakeReq("GET", "/worktree-flow/template"), templateAfterWrite);
+check("template HTTP drops project-specific sharedDocsPath", templateWrite.status === 200 && !Object.hasOwn(templateAfterWrite.json().config, "sharedDocsPath"), templateAfterWrite.body);
 
 const createRes = fakeRes();
-await httpRoutes.get("/worktree-flow/create").handler(fakeReq("POST", "/worktree-flow/create", { set: "demo", intent: { feature: "http feat", components: ["backend"], branch: "feature/http-feat", dryRun: true } }), createRes);
+await httpRoutes.get("/worktree-flow/create").handler(fakeReq("POST", "/worktree-flow/create", { set: "demo", intent: { feature: "http feat", components: ["backend"], branch: "feature/http-feat", sessionInstructions: "SQL 在 backend/sql/http-feat", dryRun: true } }), createRes);
 check("POST /create dry-run returns plan", createRes.status === 200 && createRes.json().result.dryRun === true && createRes.json().result.feature === "http-feat", createRes.body);
+check("POST /create preserves feature instruction intent", createRes.json().result.context.hasInstructions === true && createRes.json().result.context.instructionBytes > 0, createRes.body);
 
 const badRes = fakeRes();
 await httpRoutes.get("/worktree-flow/create").handler(fakeReq("POST", "/worktree-flow/create", { set: "demo", intent: {} }), badRes);
@@ -308,14 +331,65 @@ console.log("context note");
 const preStep = eventListeners.get("agent/pre-step");
 check("agent/pre-step hook registered", typeof preStep === "function");
 const featureRootForNote = join(worktreeRoot, "demo", "selection-v2");
-const noteAgent = { session: { id: "s-note", header: { cwd: featureRootForNote } } };
+const noteDocsPath = docsSnapshotPath(featureRootForNote);
+mkdirSync(noteDocsPath, { recursive: true });
+writeFileSync(join(noteDocsPath, "guide.md"), "guide\n");
+await writeFeatureContext({
+	version: 1,
+	projectName: "demo",
+	feature: "selection-v2",
+	sessionInstructions: "本分支 SQL 放在 backend/sql/selection-v2。",
+	docsSnapshot: {
+		state: "ready",
+		sourcePath: sharedDocsRoot,
+		path: noteDocsPath,
+		createdAt: new Date().toISOString(),
+		fileCount: 1,
+		bytes: 6
+	},
+	createdAt: new Date().toISOString()
+}, featureRootForNote);
+const featureInstructionsGet = fakeRes();
+await httpRoutes.get("/worktree-flow/feature-instructions").handler(fakeReq("GET", `/worktree-flow/feature-instructions?set=demo&feature=selection-v2`), featureInstructionsGet);
+check("GET /feature-instructions returns trusted feature guidance", featureInstructionsGet.status === 200 && featureInstructionsGet.json().result.sessionInstructions.includes("backend/sql/selection-v2"), featureInstructionsGet.body);
+const featureInstructionsSave = fakeRes();
+await httpRoutes.get("/worktree-flow/feature-instructions").handler(fakeReq("POST", "/worktree-flow/feature-instructions", {
+	set: "demo",
+	feature: "selection-v2",
+	sessionInstructions: "编辑后的功能区说明：SQL 在 backend/sql/selection-v3。"
+}), featureInstructionsSave);
+check("POST /feature-instructions updates trusted feature guidance", featureInstructionsSave.status === 200 && featureInstructionsSave.json().result.sessionInstructions.includes("selection-v3"), featureInstructionsSave.body);
+const noteManifestFile = join(featureRootForNote, ".dsh-worktree.json");
+const creatingManifest = JSON.parse(readFileSync(noteManifestFile, "utf8"));
+creatingManifest.status = "creating";
+writeFileSync(noteManifestFile, JSON.stringify(creatingManifest));
+const creatingAgent = { session: { id: "s-creating", header: { cwd: featureRootForNote } } };
 const nextEnter = async () => ({ kind: "enter", messages: [] });
+const whileCreating = await preStep({ agent: creatingAgent, signal: new AbortController().signal }, nextEnter);
+check("creating feature does not consume first-step context", whileCreating.messages.length === 0);
+creatingManifest.status = "ready";
+writeFileSync(noteManifestFile, JSON.stringify(creatingManifest));
+const afterReady = await preStep({ agent: creatingAgent, signal: new AbortController().signal }, nextEnter);
+check("same session receives context after feature becomes ready", afterReady.messages.length === 1 && afterReady.messages[0].content[0].text.includes("demo/selection-v2"), JSON.stringify(afterReady.messages));
+const noteAgent = { session: { id: "s-note", header: { cwd: featureRootForNote } } };
 const noted = await preStep({ agent: noteAgent, signal: new AbortController().signal }, nextEnter);
 check("first step in a feature root injects the identity note", noted.messages.length === 1 && noted.messages[0].content[0].text.includes("demo/selection-v2") && noted.messages[0].content[0].text.includes("backend"), JSON.stringify(noted.messages));
 check("note resolves the component display name from the set config", noted.messages[0].content[0].text.includes("backend（后端）"), JSON.stringify(noted.messages));
+check("note injects live project instructions", noted.messages[0].content[0].text.includes("项目统一使用 UTC 时间，并先阅读共享 docs。") && noted.messages[0].content[0].text.includes("项目会话说明"), JSON.stringify(noted.messages));
+check("note injects edited trusted feature-specific instructions", noted.messages[0].content[0].text.includes("编辑后的功能区说明：SQL 在 backend/sql/selection-v3。") && noted.messages[0].content[0].text.includes("功能区自定义说明"), JSON.stringify(noted.messages));
+check("note injects the sandbox-local docs snapshot path", noted.messages[0].content[0].text.includes(noteDocsPath) && !noted.messages[0].content[0].text.includes(`项目共享文档快照：${sharedDocsRoot}`), JSON.stringify(noted.messages));
 check("note carries plugin provenance", noted.messages[0]?.source?.plugin === "worktree-flow" && noted.messages[0]?.role === "user");
 const notedTwice = await preStep({ agent: noteAgent, signal: new AbortController().signal }, nextEnter);
 check("note fires once per session", notedTwice.messages.length === 0);
+const projectPromptUpdate = fakeRes();
+await httpRoutes.get("/worktree-flow/config").handler(fakeReq("POST", "/worktree-flow/config", {
+	set: "demo",
+	config: { ...configWithDocs.json().config, projectInstructions: "更新后的项目说明只影响之后的新会话。" },
+	revision: configWithDocs.json().revision
+}), projectPromptUpdate);
+const updatedProjectAgent = { session: { id: "s-project-updated", header: { cwd: featureRootForNote } } };
+const updatedProjectNote = await preStep({ agent: updatedProjectAgent, signal: new AbortController().signal }, nextEnter);
+check("existing feature sessions read the latest project instructions", projectPromptUpdate.status === 200 && updatedProjectNote.messages[0].content[0].text.includes("更新后的项目说明只影响之后的新会话。") && !updatedProjectNote.messages[0].content[0].text.includes("项目统一使用 UTC 时间"), JSON.stringify(updatedProjectNote.messages));
 writeFileSync(join(repoRoot, ".dsh-worktree.json"), JSON.stringify({
 	version: 1,
 	projectName: "demo",

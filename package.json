@@ -39,6 +39,6 @@
     }
   },
   "scripts": {
-    "test": "node --test test/core.test.mjs test/config-manifest.test.mjs test/integration.test.mjs && node test/load-test.mjs && node scripts/client-sim.mjs"
+    "test": "node --test test/core.test.mjs test/config-manifest.test.mjs test/feature-context.test.mjs test/integration.test.mjs && node test/load-test.mjs && node scripts/client-sim.mjs"
   }
 }

@@ -52,6 +52,11 @@ check("bundle registers exactly one handoff with id dsh-worktree-flow", () => {
 	if (handoffs[0].id !== "dsh-worktree-flow") throw new Error(`id: ${handoffs[0].id}`);
 	if (typeof handoffs[0].factory !== "function") throw new Error("factory missing");
 });
+check("bundle includes project/feature instructions and shared docs controls", () => {
+	for (const marker of ["项目会话说明", "projectInstructions", "功能区会话说明（可选）", "功能区会话说明", "保存说明", "/feature-instructions", "共享 docs 源目录", "sessionInstructions", "sharedDocsPath"]) {
+		if (!source.includes(marker)) throw new Error(`missing marker: ${marker}`);
+	}
+});
 
 // ---- 2) materialize factory (require whitelist = the shell's resolution boundary) ----
 const plugin = handoffs[0].factory((spec) => {
@@ -107,7 +112,7 @@ check("registration completes once settings.section is declared", () => {
 	if (typeof registered.options.inject().pickProjectDirectory !== "function") throw new Error("directory picker injection missing");
 });
 
-check("session badge + alert dock register into the conversation slots", () => {
+check("session badge with instructions popover + alert dock register into the conversation slots", () => {
 	declare("conversation.session.header.actions");
 	declare("conversation.input.dock");
 	const badge = registrations.get("conversation.session.header.actions:worktree-flow-badge");

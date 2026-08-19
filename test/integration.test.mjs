@@ -15,9 +15,10 @@ import os from "node:os";
 import path from "node:path";
 import { strict as assert } from "node:assert";
 import { WorktreeFlowService } from "../lib/service.js";
-import { componentGitStatus, parseWorktreeList } from "../lib/workspace.js";
-import { LEGACY_MANIFEST_NAME, MANIFEST_NAME, readManifest } from "../lib/manifest.js";
+import { assertGitWorktreeUsable, componentGitStatus, isDubiousOwnership, parseWorktreeList } from "../lib/workspace.js";
+import { LEGACY_MANIFEST_NAME, MANIFEST_NAME, readManifest, writeManifest } from "../lib/manifest.js";
 import { writeConfigTemplate } from "../lib/config.js";
+import { docsSnapshotPath, featureContextFile, readFeatureContext, writeFeatureContext } from "../lib/feature-context.js";
 
 /** Minimal SubprocessRuntime-shaped fake: spawns real git, collects output. */
 function fakeSubprocess() {
@@ -162,6 +163,41 @@ test("parseWorktreeList parses porcelain blocks", () => {
 	assert.equal(parsed[0].branch, "master");
 	assert.equal(parsed[1].branch, "feature/review");
 	assert.equal(parsed[2].branch, undefined);
+});
+
+test("dubious ownership becomes a stable error without repair commands", async (t) => {
+	const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "dsh-wf-ownership-"));
+	t.after(() => fs.promises.rm(dir, { recursive: true, force: true }));
+	const calls = [];
+	const stderr = [
+		`fatal: detected dubious ownership in repository at '${dir}'`,
+		"To add an exception for this directory, call:",
+		`git config --global --add safe.directory ${dir}`
+	].join("\n");
+	const ctx = {
+		subprocess: {
+			spawn(spec) {
+				calls.push(spec);
+				return {
+					done: Promise.resolve({ exitCode: 128, signal: undefined }),
+					collected: {
+						stdout: { readFrom: () => ({ text: "" }) },
+						stderr: { readFrom: () => ({ text: stderr }) }
+					}
+				};
+			}
+		}
+	};
+	assert.equal(isDubiousOwnership(stderr), true);
+	await assert.rejects(
+		() => assertGitWorktreeUsable(ctx, dir),
+		(error) => error.code === "GIT_OWNERSHIP_MISMATCH" && /未修改 safe\.directory/u.test(error.message)
+	);
+	assert.deepEqual(calls.map((call) => call.argv), [["git", "rev-parse", "--show-toplevel"]]);
+	const status = await componentGitStatus(ctx, { path: dir, expectedBranch: "feature/x", baseBranch: "master" });
+	assert.equal(status.ownershipMismatch, true);
+	assert.equal(calls.length, 2, "status stops after the first read and runs no repair command");
+	assert.ok(calls.every((call) => call.argv[1] !== "config"));
 });
 
 test("componentGitStatus reports non-zero safety reads instead of failing open", async (t) => {
@@ -333,6 +369,222 @@ test("create → list → sync → archive → cleanup (full lifecycle, real git
 	assert.ok(!remaining.includes("selection-v2"), remaining);
 });
 
+test("missing shared docs fails before creating a feature root", async (t) => {
+	const { scratch, service, worktreeRoot } = await setup(t);
+	const config = await service.getSet(SET);
+	await service.saveSetConfig({ ...config, sharedDocsPath: path.join(scratch, "missing-docs") });
+	await assert.rejects(
+		() => service.createFeature(SET, {
+			feature: "missing-docs",
+			components: ["backend"],
+			branch: "feature/missing-docs"
+		}),
+		(error) => error.code === "NO_DOCS"
+	);
+	assert.equal(fs.existsSync(path.join(worktreeRoot, SET, "missing-docs")), false);
+});
+
+test("unsafe docs destination parent fails before publishing manifest or context", async (t) => {
+	const { scratch, service, worktreeRoot } = await setup(t);
+	const docsSource = path.join(scratch, "junction-docs");
+	const featureRoot = path.join(worktreeRoot, SET, "junction-target");
+	const outside = path.join(scratch, "junction-outside");
+	await fs.promises.mkdir(docsSource, { recursive: true });
+	await fs.promises.mkdir(featureRoot, { recursive: true });
+	await fs.promises.mkdir(outside, { recursive: true });
+	await fs.promises.writeFile(path.join(docsSource, "guide.md"), "guide\n");
+	const config = await service.getSet(SET);
+	await service.saveSetConfig({ ...config, sharedDocsPath: docsSource });
+	try {
+		await fs.promises.symlink(outside, path.join(featureRoot, ".worktree-flow"), process.platform === "win32" ? "junction" : "dir");
+	} catch (error) {
+		if (error.code === "EPERM" || error.code === "EACCES") {
+			t.skip("platform does not permit creating a test destination link");
+			return;
+		}
+		throw error;
+	}
+
+	await assert.rejects(
+		() => service.createFeature(SET, {
+			feature: "junction-target",
+			components: ["backend"],
+			branch: "feature/junction-target"
+		}),
+		(error) => error.code === "BAD_LAYOUT"
+	);
+	assert.equal(fs.existsSync(path.join(outside, "docs", "guide.md")), false);
+	assert.equal(fs.existsSync(path.join(featureRoot, MANIFEST_NAME)), false);
+	assert.equal(fs.existsSync(featureContextFile(SET, "junction-target")), false);
+	assert.equal(fs.existsSync(path.join(featureRoot, "backend")), false);
+});
+
+test("create recovers a trusted interrupted docs publication", async (t) => {
+	const { scratch, service, worktreeRoot, backendRepo } = await setup(t);
+	const docsSource = path.join(scratch, "recovery-docs");
+	await fs.promises.mkdir(docsSource, { recursive: true });
+	await fs.promises.writeFile(path.join(docsSource, "guide.md"), "fresh\n");
+	const config = await service.getSet(SET);
+	await service.saveSetConfig({ ...config, sharedDocsPath: docsSource });
+	const featureRoot = path.join(worktreeRoot, SET, "recovery");
+	const snapshotPath = docsSnapshotPath(featureRoot);
+	await fs.promises.mkdir(snapshotPath, { recursive: true });
+	await fs.promises.writeFile(path.join(snapshotPath, "guide.md"), "fresh\n");
+	const interruptedAt = new Date().toISOString();
+	await writeManifest(featureRoot, {
+		version: 1,
+		projectName: SET,
+		feature: "recovery",
+		root: featureRoot,
+		sourceCwd: "",
+		createdAt: interruptedAt,
+		updatedAt: interruptedAt,
+		status: "creating",
+		components: {
+			backend: {
+				name: "backend",
+				repository: "backend",
+				sourcePath: backendRepo,
+				branch: "feature/recovery",
+				baseBranch: "master",
+				path: path.join(featureRoot, "backend"),
+				state: "pending"
+			}
+		}
+	});
+	await writeFeatureContext({
+		version: 1,
+		projectName: SET,
+		feature: "recovery",
+		createdAt: new Date().toISOString(),
+		docsSnapshot: {
+			state: "copying",
+			sourcePath: docsSource,
+			path: snapshotPath,
+			createdAt: new Date().toISOString(),
+			fileCount: 1,
+			bytes: 6
+		}
+	}, featureRoot);
+	await fs.promises.rm(docsSource, { recursive: true, force: true });
+
+	const created = await service.createFeature(SET, {
+		feature: "recovery",
+		components: ["backend"],
+		branch: "feature/recovery"
+	});
+	const recovered = await readFeatureContext(SET, "recovery", featureRoot);
+	assert.equal(recovered?.docsSnapshot?.state, "ready");
+	assert.equal(await fs.promises.readFile(path.join(snapshotPath, "guide.md"), "utf8"), "fresh\n");
+	assert.equal(recovered?.docsSnapshot?.sourcePath, docsSource);
+	await service.cleanupFeature(SET, created.feature);
+});
+
+test("same-path feature recreation does not inherit context without its manifest", async (t) => {
+	const { service, worktreeRoot } = await setup(t);
+	const featureRoot = path.join(worktreeRoot, SET, "recreated");
+	await fs.promises.mkdir(featureRoot, { recursive: true });
+	await writeFeatureContext({
+		version: 1,
+		projectName: SET,
+		feature: "recreated",
+		createdAt: new Date().toISOString(),
+		sessionInstructions: "这是旧功能代次，不应继承。"
+	}, featureRoot);
+
+	const created = await service.createFeature(SET, {
+		feature: "recreated",
+		components: ["backend"],
+		branch: "feature/recreated"
+	});
+	assert.equal(await readFeatureContext(SET, "recreated", featureRoot), undefined);
+	await service.cleanupFeature(SET, created.feature);
+});
+
+test("clearing instructions removes an instructions-only trusted context", async (t) => {
+	const { service } = await setup(t);
+	const created = await service.createFeature(SET, {
+		feature: "editable-instructions",
+		components: ["backend"],
+		branch: "feature/editable-instructions",
+		sessionInstructions: "创建时说明"
+	});
+	await service.saveFeatureInstructions(SET, "editable-instructions", "");
+	assert.equal(await readFeatureContext(SET, "editable-instructions", created.featureRoot), undefined);
+	await service.cleanupFeature(SET, "editable-instructions");
+});
+
+test("create snapshots project docs and stores feature instructions; cleanup removes generated context", async (t) => {
+	const { scratch, service } = await setup(t);
+	const docsSource = path.join(scratch, "main-tree-docs");
+	await fs.promises.mkdir(path.join(docsSource, "design"), { recursive: true });
+	await fs.promises.writeFile(path.join(docsSource, "design", "architecture.md"), "architecture\n");
+	const config = await service.getSet(SET);
+	await service.saveSetConfig({ ...config, sharedDocsPath: docsSource });
+
+	const created = await service.createFeature(SET, {
+		feature: "context",
+		components: ["backend"],
+		branch: "feature/context",
+		sessionInstructions: "本分支 SQL 在 backend/sql/context。"
+	});
+	const context = await readFeatureContext(SET, "context", created.featureRoot);
+	assert.equal(context?.sessionInstructions, "本分支 SQL 在 backend/sql/context。");
+	assert.equal(context?.docsSnapshot?.fileCount, 1);
+	assert.equal(
+		await fs.promises.readFile(path.join(created.featureRoot, ".worktree-flow", "docs", "design", "architecture.md"), "utf8"),
+		"architecture\n"
+	);
+	assert.equal((await service.getFeatureInstructions(SET, "context")).sessionInstructions, "本分支 SQL 在 backend/sql/context。");
+	await service.saveFeatureInstructions(SET, "context", "  修改后 SQL 在 backend/sql/context-v2。\r\n请同时更新迁移脚本。  ");
+	const editedContext = await readFeatureContext(SET, "context", created.featureRoot);
+	assert.equal(editedContext?.sessionInstructions, "修改后 SQL 在 backend/sql/context-v2。\n请同时更新迁移脚本。");
+	assert.equal(editedContext?.docsSnapshot?.state, "ready", "editing instructions preserves trusted docs metadata");
+
+	// A snapshot belongs to the feature generation: retries reuse it even if
+	// the set-level source changes or disappears, and an empty UI field does not
+	// silently clear the already-persisted instructions.
+	await fs.promises.rm(docsSource, { recursive: true, force: true });
+	const changedConfig = await service.getSet(SET);
+	await service.saveSetConfig({ ...changedConfig, sharedDocsPath: path.join(scratch, "new-missing-docs") });
+	const retried = await service.createFeature(SET, {
+		feature: "context",
+		components: ["backend"],
+		branch: "feature/context",
+		sessionInstructions: ""
+	});
+	assert.equal(retried.context.docs.reuse, true);
+	assert.equal((await readFeatureContext(SET, "context", created.featureRoot))?.sessionInstructions, "修改后 SQL 在 backend/sql/context-v2。\n请同时更新迁移脚本。");
+	await service.saveFeatureInstructions(SET, "context", "");
+	const clearedContext = await readFeatureContext(SET, "context", created.featureRoot);
+	assert.equal(clearedContext?.sessionInstructions, undefined);
+	assert.equal(clearedContext?.docsSnapshot?.state, "ready", "clearing instructions keeps the docs snapshot context");
+
+	const cleaned = await service.cleanupFeature(SET, "context");
+	assert.equal(cleaned.failed.length, 0);
+	assert.equal(cleaned.docsRemoved, true);
+	assert.equal(await readFeatureContext(SET, "context", created.featureRoot), undefined);
+});
+
+test("malformed trusted context blocks before deletion and force cleanup recovers", async (t) => {
+	const { service } = await setup(t);
+	const created = await service.createFeature(SET, {
+		feature: "broken-context",
+		components: ["backend"],
+		branch: "feature/broken-context",
+		sessionInstructions: "trusted"
+	});
+	await fs.promises.writeFile(featureContextFile(SET, "broken-context"), "{broken", "utf8");
+	await assert.rejects(
+		() => service.cleanupFeature(SET, "broken-context"),
+		(error) => error.code === "BLOCKED"
+	);
+	assert.equal(fs.existsSync(path.join(created.featureRoot, "backend")), true, "context error is detected before worktree deletion");
+	const cleaned = await service.cleanupFeature(SET, "broken-context", { force: true });
+	assert.equal(cleaned.failed.length, 0);
+	assert.equal(fs.existsSync(featureContextFile(SET, "broken-context")), false);
+});
+
 test("cleanup preserves unknown manifest-prefixed files and releases component registrations", async (t) => {
 	const { registry, service } = await setup(t);
 	const created = await service.createFeature(SET, {
@@ -349,7 +601,10 @@ test("cleanup preserves unknown manifest-prefixed files and releases component r
 	assert.equal(cleaned.failed.length, 0);
 	assert.equal(cleaned.rootRemoved, false, "unknown prefixed file prevents recursive root deletion");
 	assert.ok(fs.existsSync(note), "user file is preserved");
+	assert.equal(fs.existsSync(path.join(created.featureRoot, MANIFEST_NAME)), false, "plugin manifest is removed so sync cannot re-adopt a cleaned feature");
 	assert.equal(registry.list().length, 0, "root and component registrations are released");
+	const synced = await service.sync(SET);
+	assert.ok(!synced.actions.some((action) => action.feature === "cleanup-guard" && action.action === "registered"));
 });
 
 test("invalid configured component names cannot escape the feature root", async (t) => {
@@ -449,6 +704,41 @@ test("sync adopts legacy manifests (migrate + register) and reports orphans", as
 	assert.ok(again.actions.some((action) => action.feature === "done" && action.action === "skip-archived"));
 });
 
+test("sync skips registration when a component has dubious ownership", async (t) => {
+	const { ctx, service, registry } = await setup(t);
+	const created = await service.createFeature(SET, {
+		feature: "sync-owner",
+		components: ["backend"],
+		branch: "feature/sync-owner"
+	});
+	await service.unregisterFeatureWorkspace(SET, created.feature);
+	assert.equal(registry.list().length, 0);
+	const target = created.manifest.components.backend.path;
+	const originalSpawn = ctx.subprocess.spawn.bind(ctx.subprocess);
+	ctx.subprocess.spawn = (spec) => {
+		if (spec.cwd === target && spec.argv.join(" ") === "git rev-parse --show-toplevel") {
+			return {
+				done: Promise.resolve({ exitCode: 128, signal: undefined }),
+				collected: {
+					stdout: { readFrom: () => ({ text: "" }) },
+					stderr: { readFrom: () => ({ text: `fatal: detected dubious ownership in repository at '${target}'` }) }
+				}
+			};
+		}
+		return originalSpawn(spec);
+	};
+	const synced = await service.sync(SET);
+	assert.ok(synced.actions.some((action) => action.feature === "sync-owner" && action.action === "ownership-blocked"));
+	assert.equal(registry.list().length, 0);
+	await assert.rejects(
+		() => service.registerFeatureWorkspace(SET, "sync-owner"),
+		(error) => error.code === "GIT_OWNERSHIP_MISMATCH"
+	);
+	assert.equal(registry.list().length, 0);
+	ctx.subprocess.spawn = originalSpawn;
+	await service.cleanupFeature(SET, created.feature, { force: true });
+});
+
 test("archive unregisters by default; keepRegistered preserves", async (t) => {
 	const { registry, service } = await setup(t);
 
@@ -492,6 +782,54 @@ test("concurrent creates of one feature serialize and preserve one valid manifes
 	const loaded = await readManifest(first.featureRoot, { projectName: SET, feature: "concurrent" });
 	assert.equal(loaded?.manifest.status, "ready");
 	assert.deepEqual(Object.keys(loaded?.manifest.components ?? {}), ["backend"]);
+});
+
+test("ownership mismatch stops creation before registration and is retriable", async (t) => {
+	const { ctx, service, registry, worktreeRoot, backendRepo } = await setup(t);
+	const target = path.join(worktreeRoot, SET, "owner-blocked", "backend");
+	const originalSpawn = ctx.subprocess.spawn.bind(ctx.subprocess);
+	const calls = [];
+	ctx.subprocess.spawn = (spec) => {
+		calls.push(spec);
+		if (spec.cwd === target && spec.argv.join(" ") === "git rev-parse --show-toplevel") {
+			return {
+				done: Promise.resolve({ exitCode: 128, signal: undefined }),
+				collected: {
+					stdout: { readFrom: () => ({ text: "" }) },
+					stderr: { readFrom: () => ({ text: `fatal: detected dubious ownership in repository at '${target}'` }) }
+				}
+			};
+		}
+		return originalSpawn(spec);
+	};
+
+	await assert.rejects(
+		() => service.createFeature(SET, {
+			feature: "owner-blocked",
+			components: ["backend"],
+			branch: "feature/owner-blocked"
+		}),
+		(error) => error.code === "GIT_OWNERSHIP_MISMATCH"
+	);
+	const blocked = await readManifest(path.join(worktreeRoot, SET, "owner-blocked"));
+	assert.equal(blocked?.manifest.status, "failed");
+	assert.equal(blocked?.manifest.components.backend.state, "failed");
+	assert.equal(registry.list().length, 0, "unsafe feature root is not registered");
+	assert.ok(fs.existsSync(target), "plugin does not automatically delete the worktree");
+	assert.ok(calls.every((call) => !call.argv.includes("config") && !call.argv.includes("remove")), "no repair or cleanup command is executed");
+
+	ctx.subprocess.spawn = originalSpawn;
+	const retried = await service.createFeature(SET, {
+		feature: "owner-blocked",
+		components: ["backend"],
+		branch: "feature/owner-blocked"
+	});
+	assert.equal(retried.status, "ready");
+	assert.equal(retried.results[0].state, "existing");
+	assert.equal(registry.list().length, 1);
+	await service.cleanupFeature(SET, retried.feature, { force: true });
+	const remaining = await run(backendRepo, ["worktree", "list", "--porcelain"]);
+	assert.ok(!remaining.includes("owner-blocked"));
 });
 
 test("partial failure is recorded and retriable", async (t) => {
@@ -574,6 +912,7 @@ test("prefillSet is template-only: no probing, paths stripped", async (t) => {
 	await writeConfigTemplate({
 		worktreeRoot: path.join(scratch, "template-wt"),
 		defaultBaseBranch: "main",
+		sharedDocsPath: path.join(scratch, "must-not-prefill"),
 		repositories: {
 			backend: { label: "后端" },
 			frontend: { label: "前端", defaultBaseBranch: "dev", path: "D:/should-be-stripped" }
@@ -582,6 +921,7 @@ test("prefillSet is template-only: no probing, paths stripped", async (t) => {
 	const prefill = await service.prefillSet();
 	assert.equal(prefill.worktreeRoot, path.join(scratch, "template-wt"));
 	assert.equal(prefill.defaultBaseBranch, "main");
+	assert.equal(Object.hasOwn(prefill, "sharedDocsPath"), false, "project-specific docs are configured per set, never inherited from the template");
 	assert.equal(prefill.repositories.backend.label, "后端");
 	assert.equal(prefill.repositories.backend.path, undefined, "vocabulary only");
 	assert.equal(prefill.repositories.frontend.defaultBaseBranch, "dev");
