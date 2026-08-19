@@ -56,6 +56,9 @@ test("normalizeBranchName: rejects git-forbidden shapes", () => {
 	assert.throws(() => normalizeBranchName("feature/../x"), (e) => e.code === "BAD_BRANCH");
 	assert.throws(() => normalizeBranchName("bad name"), (e) => e.code === "BAD_BRANCH");
 	assert.throws(() => normalizeBranchName("trailing/"), (e) => e.code === "BAD_BRANCH");
+	for (const invalid of [".foo", "foo.", "foo.lock", "foo@{bar}", "foo//bar", "@", "feature/.hidden"]) {
+		assert.throws(() => normalizeBranchName(invalid), (e) => e.code === "BAD_BRANCH", invalid);
+	}
 	assert.throws(() => normalizeBranchName(""), (e) => e.code === "BAD_BRANCH");
 });
 

@@ -38,7 +38,7 @@ Primary entry: the **Settings → Worktree Flow** page
 - **新仓库组模板**: a collapsed card at the bottom of the config tab editing `$DSH_HOME/worktree-flow.json` — read ONCE when a set is created (worktree root, default base branch, component vocabulary); never affects existing sets.
 - **Feature workspaces**: pick a set, then browse feature groups (branch / dirty / ahead-behind / unpushed / registration state / session count), archive and cleanup; only fully-configured sets (worktree root + all components bound) can be used for creation.
 - **Branch types**: a collapsed card on the config tab editing the global vocabulary `$DSH_HOME/worktree-flow/branch-types.json` — built-in Bugfix/功能/Hotfix/发布 on first install, fully editable; the create wizard composes the full branch name from type + topic (or「自定义」for a verbatim name).
-- Component paths support a leading `~`.
+- Worktree-root and component paths must be absolute; component paths support a leading `~`.
 - The sidebar「新增工作区」flow offers「功能工作区」: pick the target set, and the creation wizard lists all of its components.
 
 Commands (fallback, scriptable; the set is inferred from the session cwd by path matching, `--set <name>` overrides):
@@ -56,7 +56,7 @@ Commands (fallback, scriptable; the set is inferred from the session cwd by path
 
 - create → registered (the sidebar shows `set/feature`)
 - finish (archive) → unlisted by default (**only the registry record is removed** — files/branches/session history stay; sessions fall back to Ungrouped)
-- need it back → `/worktree sync` re-registers in seconds
+- need it back → `/worktree open <feature>` re-registers that feature (`sync` continues to skip archived features)
 - finish --cleanup → deletes worktree directories after a guarded double-confirm; uncommitted/unpushed content is listed and requires force
 
 So the sidebar only ever shows **active features**.

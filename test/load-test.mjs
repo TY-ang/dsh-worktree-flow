@@ -175,6 +175,8 @@ console.log("finish (archive)");
 const archived = await worktree.handler(invocation("finish selection-v2"));
 check("archive unregisters by default", archived.kind === "success" && archived.text.includes("下架"), archived.text);
 check("registry empty after archive", fakeRegistry.list().length === 0);
+const reopened = await worktree.handler(invocation("open selection-v2"));
+check("open re-registers an archived feature explicitly", reopened.kind === "success" && fakeRegistry.list().length === 1, reopened.text);
 
 console.log("errors");
 const bogus = await worktree.handler(invocation("bogus"));
@@ -197,7 +199,15 @@ function fakeReq(method, url, body) {
 	req.method = method;
 	req.url = url;
 	// 真实 HTTP/1.1 请求必带 Host；loopback 防护要求它是 loopback。
-	req.headers = { host: "127.0.0.1:3080" };
+	req.headers = method === "POST"
+		? {
+			host: "127.0.0.1:3080",
+			origin: "http://127.0.0.1:3080",
+			"sec-fetch-site": "same-origin",
+			"content-type": "application/json",
+			"x-worktree-flow-request": "1"
+		}
+		: { host: "127.0.0.1:3080" };
 	process.nextTick(() => {
 		if (body !== undefined) req.emit("data", Buffer.from(JSON.stringify(body)));
 		req.emit("end");
@@ -267,6 +277,33 @@ rebindReq.headers = { host: "attacker.example.com" };
 await httpRoutes.get("/worktree-flow/sets").handler(rebindReq, rebind);
 check("foreign Host (DNS rebinding) is rejected with 403", rebind.status === 403, rebind.body);
 
+const localPort = fakeRes();
+const localPortReq = fakeReq("POST", "/worktree-flow/cleanup", { set: "demo", feature: "selection-v2", force: true });
+localPortReq.headers = {
+	host: "127.0.0.1:3080",
+	origin: "http://127.0.0.1:9999",
+	"sec-fetch-site": "same-site",
+	"content-type": "text/plain"
+};
+await httpRoutes.get("/worktree-flow/cleanup").handler(localPortReq, localPort);
+check("different localhost port simple POST is rejected", localPort.status === 403, localPort.body);
+
+const wrongMethod = fakeRes();
+await httpRoutes.get("/worktree-flow/cleanup").handler(fakeReq("GET", "/worktree-flow/cleanup"), wrongMethod);
+check("destructive route rejects the wrong method", wrongMethod.status === 405, wrongMethod.body);
+
+const emptyFeature = fakeRes();
+await httpRoutes.get("/worktree-flow/register").handler(fakeReq("POST", "/worktree-flow/register", { set: "demo", feature: "纯中文" }), emptyFeature);
+check("register rejects a feature that slugifies empty", emptyFeature.status === 400 && emptyFeature.json().code === "BAD_FEATURE", emptyFeature.body);
+
+const staleConfig = fakeRes();
+await httpRoutes.get("/worktree-flow/config").handler(fakeReq("POST", "/worktree-flow/config", {
+	set: "demo",
+	config: configRes.json().config,
+	revision: "stale"
+}), staleConfig);
+check("config save rejects a stale revision", staleConfig.status === 400 && staleConfig.json().code === "CONFIG_CONFLICT", staleConfig.body);
+
 console.log("context note");
 const preStep = eventListeners.get("agent/pre-step");
 check("agent/pre-step hook registered", typeof preStep === "function");
@@ -279,8 +316,19 @@ check("note resolves the component display name from the set config", noted.mess
 check("note carries plugin provenance", noted.messages[0]?.source?.plugin === "worktree-flow" && noted.messages[0]?.role === "user");
 const notedTwice = await preStep({ agent: noteAgent, signal: new AbortController().signal }, nextEnter);
 check("note fires once per session", notedTwice.messages.length === 0);
+writeFileSync(join(repoRoot, ".dsh-worktree.json"), JSON.stringify({
+	version: 1,
+	projectName: "demo",
+	feature: "forged",
+	root: repoRoot,
+	sourceCwd: "",
+	createdAt: new Date().toISOString(),
+	updatedAt: new Date().toISOString(),
+	status: "ready",
+	components: {}
+}));
 const outside = await preStep({ agent: { session: { id: "s-out", header: { cwd: repoRoot } } }, signal: new AbortController().signal }, nextEnter);
-check("cwd outside any feature workspace gets no note", outside.messages.length === 0);
+check("forged manifest outside configured feature layout injects no note", outside.messages.length === 0);
 
 console.log(failed === 0 ? "\nLOAD TEST PASSED" : `\nLOAD TEST FAILED (${failed} failures)`);
 process.exit(failed === 0 ? 0 : 1);

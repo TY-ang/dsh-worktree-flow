@@ -15,7 +15,7 @@ import os from "node:os";
 import path from "node:path";
 import { strict as assert } from "node:assert";
 import { WorktreeFlowService } from "../lib/service.js";
-import { parseWorktreeList } from "../lib/workspace.js";
+import { componentGitStatus, parseWorktreeList } from "../lib/workspace.js";
 import { LEGACY_MANIFEST_NAME, MANIFEST_NAME, readManifest } from "../lib/manifest.js";
 import { writeConfigTemplate } from "../lib/config.js";
 
@@ -164,6 +164,27 @@ test("parseWorktreeList parses porcelain blocks", () => {
 	assert.equal(parsed[2].branch, undefined);
 });
 
+test("componentGitStatus reports non-zero safety reads instead of failing open", async (t) => {
+	const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "dsh-wf-status-"));
+	t.after(() => fs.promises.rm(dir, { recursive: true, force: true }));
+	const ctx = {
+		subprocess: {
+			spawn() {
+				return {
+					done: Promise.resolve({ exitCode: 128, signal: undefined }),
+					collected: {
+						stdout: { readFrom: () => ({ text: "" }) },
+						stderr: { readFrom: () => ({ text: "simulated git failure" }) }
+					}
+				};
+			}
+		}
+	};
+	const status = await componentGitStatus(ctx, { path: dir, expectedBranch: "feature/x", baseBranch: "master" });
+	assert.equal(status.present, true);
+	assert.match(status.readError ?? "", /无法读取当前分支|无法读取工作区状态/u);
+});
+
 test("getSet/listSets/resolveForCwd: the set model surface", async (t) => {
 	const { scratch, backendRepo, worktreeRoot, service } = await setup(t);
 
@@ -215,7 +236,7 @@ test("unbound component refuses with UNBOUND_COMPONENT", async (t) => {
 	const { backendRepo, service } = await setup(t);
 	await service.saveSetConfig({
 		name: SET,
-		worktreeRoot: path.join(t.name, "unused"),
+		worktreeRoot: path.join(path.dirname(backendRepo), "unused"),
 		defaultBaseBranch: "master",
 		repositories: { backend: { path: backendRepo }, ghost: { label: "幽灵" } }
 	});
@@ -312,6 +333,62 @@ test("create → list → sync → archive → cleanup (full lifecycle, real git
 	assert.ok(!remaining.includes("selection-v2"), remaining);
 });
 
+test("cleanup preserves unknown manifest-prefixed files and releases component registrations", async (t) => {
+	const { registry, service } = await setup(t);
+	const created = await service.createFeature(SET, {
+		feature: "cleanup-guard",
+		components: ["backend"],
+		branch: "feature/cleanup-guard",
+		registerComponents: true
+	});
+	assert.equal(registry.list().length, 2, "feature root + component are registered");
+	const note = path.join(created.featureRoot, ".dsh-worktree-notes");
+	await fs.promises.writeFile(note, "keep me\n");
+
+	const cleaned = await service.cleanupFeature(SET, "cleanup-guard");
+	assert.equal(cleaned.failed.length, 0);
+	assert.equal(cleaned.rootRemoved, false, "unknown prefixed file prevents recursive root deletion");
+	assert.ok(fs.existsSync(note), "user file is preserved");
+	assert.equal(registry.list().length, 0, "root and component registrations are released");
+});
+
+test("invalid configured component names cannot escape the feature root", async (t) => {
+	const { service, worktreeRoot } = await setup(t);
+	await assert.rejects(
+		() => service.saveSetConfig({
+			name: SET,
+			worktreeRoot,
+			defaultBaseBranch: "master",
+			repositories: { "../../escape": { path: worktreeRoot } }
+		}),
+		(error) => error.code === "BAD_COMPONENT"
+	);
+});
+
+test("one invalid manifest is isolated instead of breaking the whole set", async (t) => {
+	const { worktreeRoot, service } = await setup(t);
+	await service.createFeature(SET, { feature: "healthy", components: ["backend"], branch: "feature/healthy" });
+	const badRoot = path.join(worktreeRoot, SET, "bad");
+	await fs.promises.mkdir(badRoot, { recursive: true });
+	await fs.promises.writeFile(path.join(badRoot, MANIFEST_NAME), JSON.stringify({
+		version: 1,
+		projectName: SET,
+		feature: "bad",
+		root: worktreeRoot,
+		sourceCwd: "",
+		createdAt: new Date().toISOString(),
+		updatedAt: new Date().toISOString(),
+		status: "ready",
+		components: {}
+	}));
+	const listed = await service.listFeatures(SET, { withGit: false });
+	assert.deepEqual(listed.features.map((entry) => entry.feature), ["healthy"]);
+	assert.equal(listed.manifestErrors.length, 1);
+	const synced = await service.sync(SET);
+	assert.ok(synced.actions.some((action) => action.action === "invalid-manifest" && action.feature === "bad"));
+	assert.ok(!synced.orphans.includes(badRoot), "invalid manifest is diagnosed, not mislabeled as an orphan");
+});
+
 test("sync adopts legacy manifests (migrate + register) and reports orphans", async (t) => {
 	const { backendRepo, worktreeRoot, registry, service } = await setup(t);
 
@@ -402,6 +479,21 @@ test("conflicts refuse before touching disk", async (t) => {
 	assert.ok(!fs.existsSync(path.join(scratch, "wt", SET, "clash", "backend")), "no partial creation");
 });
 
+test("concurrent creates of one feature serialize and preserve one valid manifest", async (t) => {
+	const { service } = await setup(t);
+	const intent = { feature: "concurrent", components: ["backend"], branch: "feature/concurrent" };
+	const [first, second] = await Promise.all([
+		service.createFeature(SET, intent),
+		service.createFeature(SET, intent)
+	]);
+	assert.equal(first.status, "ready");
+	assert.equal(second.status, "ready");
+	assert.deepEqual([first.results[0].state, second.results[0].state].sort(), ["created", "existing"]);
+	const loaded = await readManifest(first.featureRoot, { projectName: SET, feature: "concurrent" });
+	assert.equal(loaded?.manifest.status, "ready");
+	assert.deepEqual(Object.keys(loaded?.manifest.components ?? {}), ["backend"]);
+});
+
 test("partial failure is recorded and retriable", async (t) => {
 	const { scratch, backendRepo, service } = await setup(t);
 
@@ -424,6 +516,12 @@ test("partial failure is recorded and retriable", async (t) => {
 	assert.equal(manifest?.manifest.status, "partial");
 	assert.equal(manifest?.manifest.components.frontend.state, "failed");
 	assert.equal(result.registration?.state, "registered");
+
+	// Retrying only the healthy subset must derive status from the merged
+	// manifest, not incorrectly report ready from this invocation alone.
+	const retried = await service.createFeature(SET, { feature: "partial", components: ["backend"], branch: "feature/partial" });
+	assert.equal(retried.status, "partial");
+	assert.equal(retried.manifest.components.frontend.state, "failed");
 });
 
 test("validateConfig: healthy config passes, broken pieces surface inline", async (t) => {

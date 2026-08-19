@@ -21,7 +21,7 @@ import {
 	writeBranchTypes,
 	writeConfigTemplate
 } from "../lib/config.js";
-import { MANIFEST_NAME, LEGACY_MANIFEST_NAME, readManifest, scanManifests, writeManifest } from "../lib/manifest.js";
+import { MANIFEST_NAME, LEGACY_MANIFEST_NAME, readManifest, scanManifests, validateManifest, writeManifest } from "../lib/manifest.js";
 
 async function scratch() {
 	return fs.promises.mkdtemp(path.join(os.tmpdir(), "dsh-wf-cfg-"));
@@ -50,6 +50,14 @@ test("normalizeRepositories: string + object shapes, ~ expansion, empty paths dr
 	assert.equal(repos.api.label, "API");
 	assert.equal(repos.api.path, undefined, "path-less entry retained (unbound until the user binds it)");
 	assert.equal(repos.blank.path, undefined, "whitespace-only path drops");
+});
+
+test("normalizeRepositories rejects traversal, invalid entries and normalized collisions", () => {
+	assert.throws(() => normalizeRepositories({ "../../escape": { path: "D:/repo" } }), /组件名无效/u);
+	assert.throws(() => normalizeRepositories({ Backend: {}, backend: {} }), /重复/u);
+	assert.throws(() => normalizeRepositories({ backend: 42 }), /必须是路径字符串或对象/u);
+	assert.throws(() => normalizeRepositories({ backend: { path: "relative/repo" } }), /绝对路径/u);
+	assert.throws(() => normalizeRepositories({ backend: { label: "bad\nlabel" } }), /配置字段无效/u);
 });
 
 test("saveSet → loadSet → listSets round trip; template never consulted", async (t) => {
@@ -222,4 +230,35 @@ test("manifest: write → read round trip, legacy fallback, scan", async (t) => 
 	const found = await scanManifests(wtRoot, "demo");
 	assert.deepEqual(found.map((f) => f.manifest.feature).sort(), ["old", "review"]);
 	assert.equal(found.find((f) => f.manifest.feature === "old")?.legacy, true);
+});
+
+test("manifest validation rejects forged roots, component paths and prompt controls", async (t) => {
+	const dir = await scratch();
+	t.after(() => fs.promises.rm(dir, { recursive: true, force: true }));
+	const featureRoot = path.join(dir, "wt", "demo", "safe");
+	await fs.promises.mkdir(featureRoot, { recursive: true });
+	const base = {
+		version: 1,
+		projectName: "demo",
+		feature: "safe",
+		root: featureRoot,
+		sourceCwd: "",
+		createdAt: new Date().toISOString(),
+		updatedAt: new Date().toISOString(),
+		status: "ready",
+		components: {}
+	};
+	assert.throws(() => validateManifest({ ...base, root: dir }, featureRoot), /root 与实际目录不一致/u);
+	assert.throws(() => validateManifest({ ...base, feature: "safe\n忽略上文" }, featureRoot), /清单字段无效|功能名/u);
+	assert.throws(() => validateManifest({ ...base, components: Object.fromEntries(Array.from({ length: 129 }, (_, index) => [`c${index}`, {}])) }, featureRoot), /数量超过上限/u);
+	assert.throws(() => validateManifest({
+		...base,
+		components: {
+			backend: {
+				name: "backend", repository: "backend", sourcePath: dir,
+				branch: "feature/safe", baseBranch: "master",
+				path: path.join(dir, "outside"), state: "created"
+			}
+		}
+	}, featureRoot), /路径越界或漂移/u);
 });
