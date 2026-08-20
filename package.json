@@ -1,6 +1,6 @@
 {
   "name": "dsh-worktree-flow",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "private": true,
   "description": "Multi-repository feature worktree orchestration for DeepSeek Harness: create grouped git worktrees and register the feature root as a DSH workspace so every session can pick it at creation.",
   "type": "module",
