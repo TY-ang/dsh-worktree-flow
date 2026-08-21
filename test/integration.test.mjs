@@ -417,42 +417,39 @@ test("missing shared docs fails before creating a feature root", async (t) => {
 	assert.equal(fs.existsSync(path.join(worktreeRoot, SET, "missing-docs")), false);
 });
 
-test("unsafe docs destination parent fails before publishing manifest or context", async (t) => {
+test("shared docs source rejects a symlink or junction before feature side effects", async (t) => {
 	const { scratch, service, worktreeRoot } = await setup(t);
-	const docsSource = path.join(scratch, "junction-docs");
-	const featureRoot = path.join(worktreeRoot, SET, "junction-target");
-	const outside = path.join(scratch, "junction-outside");
-	await fs.promises.mkdir(docsSource, { recursive: true });
-	await fs.promises.mkdir(featureRoot, { recursive: true });
-	await fs.promises.mkdir(outside, { recursive: true });
-	await fs.promises.writeFile(path.join(docsSource, "guide.md"), "guide\n");
-	const config = await service.getSet(SET);
-	await service.saveSetConfig({ ...config, sharedDocsPath: docsSource });
+	const realDocs = path.join(scratch, "real-docs");
+	const docsLink = path.join(scratch, "linked-docs");
+	const featureRoot = path.join(worktreeRoot, SET, "junction-source");
+	await fs.promises.mkdir(realDocs, { recursive: true });
+	await fs.promises.writeFile(path.join(realDocs, "guide.md"), "guide\n");
 	try {
-		await fs.promises.symlink(outside, path.join(featureRoot, ".worktree-flow"), process.platform === "win32" ? "junction" : "dir");
+		await fs.promises.symlink(realDocs, docsLink, process.platform === "win32" ? "junction" : "dir");
 	} catch (error) {
 		if (error.code === "EPERM" || error.code === "EACCES") {
-			t.skip("platform does not permit creating a test destination link");
+			t.skip("platform does not permit creating a test source link");
 			return;
 		}
 		throw error;
 	}
+	const config = await service.getSet(SET);
+	await service.saveSetConfig({ ...config, sharedDocsPath: docsLink });
 
 	await assert.rejects(
 		() => service.createFeature(SET, {
-			feature: "junction-target",
+			feature: "junction-source",
 			components: ["backend"],
-			branch: "feature/junction-target"
+			branch: "feature/junction-source"
 		}),
-		(error) => error.code === "BAD_LAYOUT"
+		(error) => error.code === "DOCS_SYMLINK"
 	);
-	assert.equal(fs.existsSync(path.join(outside, "docs", "guide.md")), false);
 	assert.equal(fs.existsSync(path.join(featureRoot, MANIFEST_NAME)), false);
-	assert.equal(fs.existsSync(featureContextFile(SET, "junction-target")), false);
+	assert.equal(fs.existsSync(featureContextFile(SET, "junction-source")), false);
 	assert.equal(fs.existsSync(path.join(featureRoot, "backend")), false);
 });
 
-test("create recovers a trusted interrupted docs publication", async (t) => {
+test("create preserves legacy snapshot metadata so cleanup can remove it", async (t) => {
 	const { scratch, service, worktreeRoot, backendRepo } = await setup(t);
 	const docsSource = path.join(scratch, "recovery-docs");
 	await fs.promises.mkdir(docsSource, { recursive: true });
@@ -499,7 +496,6 @@ test("create recovers a trusted interrupted docs publication", async (t) => {
 			bytes: 6
 		}
 	}, featureRoot);
-	await fs.promises.rm(docsSource, { recursive: true, force: true });
 
 	const created = await service.createFeature(SET, {
 		feature: "recovery",
@@ -507,16 +503,39 @@ test("create recovers a trusted interrupted docs publication", async (t) => {
 		branch: "feature/recovery"
 	});
 	const recovered = await readFeatureContext(SET, "recovery", featureRoot);
-	assert.equal(recovered?.docsSnapshot?.state, "ready");
+	assert.equal(recovered?.docsSnapshot?.state, "copying");
 	assert.equal(await fs.promises.readFile(path.join(snapshotPath, "guide.md"), "utf8"), "fresh\n");
 	assert.equal(recovered?.docsSnapshot?.sourcePath, docsSource);
-	await service.cleanupFeature(SET, created.feature);
+	const cleaned = await service.cleanupFeature(SET, created.feature);
+	assert.equal(cleaned.docsRemoved, true);
+	assert.equal(fs.existsSync(snapshotPath), false);
+});
+
+test("cleanup removes an orphaned legacy docs snapshot without context metadata", async (t) => {
+	const { service } = await setup(t);
+	const created = await service.createFeature(SET, {
+		feature: "orphan-docs",
+		components: ["backend"],
+		branch: "feature/orphan-docs"
+	});
+	const orphanSnapshot = docsSnapshotPath(created.featureRoot);
+	await fs.promises.mkdir(orphanSnapshot, { recursive: true });
+	await fs.promises.writeFile(path.join(orphanSnapshot, "stale.md"), "stale\n");
+	assert.equal(await readFeatureContext(SET, "orphan-docs", created.featureRoot), undefined);
+
+	const cleaned = await service.cleanupFeature(SET, "orphan-docs");
+	assert.equal(cleaned.failed.length, 0);
+	assert.equal(cleaned.docsRemoved, true);
+	assert.equal(fs.existsSync(orphanSnapshot), false);
 });
 
 test("same-path feature recreation does not inherit context without its manifest", async (t) => {
 	const { service, worktreeRoot } = await setup(t);
 	const featureRoot = path.join(worktreeRoot, SET, "recreated");
 	await fs.promises.mkdir(featureRoot, { recursive: true });
+	const staleSnapshot = docsSnapshotPath(featureRoot);
+	await fs.promises.mkdir(staleSnapshot, { recursive: true });
+	await fs.promises.writeFile(path.join(staleSnapshot, "old.md"), "old\n");
 	await writeFeatureContext({
 		version: 1,
 		projectName: SET,
@@ -531,6 +550,7 @@ test("same-path feature recreation does not inherit context without its manifest
 		branch: "feature/recreated"
 	});
 	assert.equal(await readFeatureContext(SET, "recreated", featureRoot), undefined);
+	assert.equal(fs.existsSync(staleSnapshot), false, "same-path recreation removes plugin-owned legacy snapshot data");
 	await service.cleanupFeature(SET, created.feature);
 });
 
@@ -547,11 +567,12 @@ test("clearing instructions removes an instructions-only trusted context", async
 	await service.cleanupFeature(SET, "editable-instructions");
 });
 
-test("create snapshots project docs and stores feature instructions; cleanup removes generated context", async (t) => {
+test("features use the live shared docs source and keep instructions separately", async (t) => {
 	const { scratch, service } = await setup(t);
 	const docsSource = path.join(scratch, "main-tree-docs");
 	await fs.promises.mkdir(path.join(docsSource, "design"), { recursive: true });
-	await fs.promises.writeFile(path.join(docsSource, "design", "architecture.md"), "architecture\n");
+	const sourceFile = path.join(docsSource, "design", "architecture.md");
+	await fs.promises.writeFile(sourceFile, "architecture\n");
 	const config = await service.getSet(SET);
 	await service.saveSetConfig({ ...config, sharedDocsPath: docsSource });
 
@@ -563,40 +584,37 @@ test("create snapshots project docs and stores feature instructions; cleanup rem
 	});
 	const context = await readFeatureContext(SET, "context", created.featureRoot);
 	assert.equal(context?.sessionInstructions, "本分支 SQL 在 backend/sql/context。");
-	assert.equal(context?.docsSnapshot?.fileCount, 1);
-	assert.equal(
-		await fs.promises.readFile(path.join(created.featureRoot, ".worktree-flow", "docs", "design", "architecture.md"), "utf8"),
-		"architecture\n"
-	);
-	assert.equal((await service.getFeatureInstructions(SET, "context")).sessionInstructions, "本分支 SQL 在 backend/sql/context。");
+	assert.equal(context?.docsSnapshot, undefined);
+	assert.equal(created.context.docs.sourcePath, docsSource);
+	assert.equal(created.context.docs.direct, true);
+	assert.equal(fs.existsSync(path.join(created.featureRoot, ".worktree-flow", "docs")), false, "no per-feature docs copy is created");
+	await fs.promises.writeFile(sourceFile, "updated architecture\n");
+	assert.equal(await fs.promises.readFile(sourceFile, "utf8"), "updated architecture\n");
+
 	await service.saveFeatureInstructions(SET, "context", "  修改后 SQL 在 backend/sql/context-v2。\r\n请同时更新迁移脚本。  ");
 	const editedContext = await readFeatureContext(SET, "context", created.featureRoot);
 	assert.equal(editedContext?.sessionInstructions, "修改后 SQL 在 backend/sql/context-v2。\n请同时更新迁移脚本。");
-	assert.equal(editedContext?.docsSnapshot?.state, "ready", "editing instructions preserves trusted docs metadata");
+	assert.equal(editedContext?.docsSnapshot, undefined);
 
-	// A snapshot belongs to the feature generation: retries reuse it even if
-	// the set-level source changes or disappears, and an empty UI field does not
-	// silently clear the already-persisted instructions.
-	await fs.promises.rm(docsSource, { recursive: true, force: true });
+	const nextDocsSource = path.join(scratch, "next-live-docs");
+	await fs.promises.mkdir(nextDocsSource, { recursive: true });
 	const changedConfig = await service.getSet(SET);
-	await service.saveSetConfig({ ...changedConfig, sharedDocsPath: path.join(scratch, "new-missing-docs") });
+	await service.saveSetConfig({ ...changedConfig, sharedDocsPath: nextDocsSource });
 	const retried = await service.createFeature(SET, {
 		feature: "context",
 		components: ["backend"],
 		branch: "feature/context",
 		sessionInstructions: ""
 	});
-	assert.equal(retried.context.docs.reuse, true);
+	assert.equal(retried.context.docs.sourcePath, nextDocsSource, "existing features follow the current shared docs configuration");
 	assert.equal((await readFeatureContext(SET, "context", created.featureRoot))?.sessionInstructions, "修改后 SQL 在 backend/sql/context-v2。\n请同时更新迁移脚本。");
 	await service.saveFeatureInstructions(SET, "context", "");
-	const clearedContext = await readFeatureContext(SET, "context", created.featureRoot);
-	assert.equal(clearedContext?.sessionInstructions, undefined);
-	assert.equal(clearedContext?.docsSnapshot?.state, "ready", "clearing instructions keeps the docs snapshot context");
+	assert.equal(await readFeatureContext(SET, "context", created.featureRoot), undefined);
 
 	const cleaned = await service.cleanupFeature(SET, "context");
 	assert.equal(cleaned.failed.length, 0);
-	assert.equal(cleaned.docsRemoved, true);
-	assert.equal(await readFeatureContext(SET, "context", created.featureRoot), undefined);
+	assert.equal(cleaned.docsRemoved, false);
+	assert.equal(fs.existsSync(nextDocsSource), true, "cleanup never removes the shared source");
 });
 
 test("malformed trusted context blocks before deletion and force cleanup recovers", async (t) => {

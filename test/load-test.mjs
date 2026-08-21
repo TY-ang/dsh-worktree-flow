@@ -8,16 +8,17 @@
  *
  * Run: node test/load-test.mjs
  */
-import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, existsSync } from "node:fs";
+import fs, { mkdtempSync, mkdirSync, readFileSync, writeFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { docsSnapshotPath, writeFeatureContext } from "../lib/feature-context.js";
+import path, { join } from "node:path";
+import { writeFeatureContext } from "../lib/feature-context.js";
 
 const commands = new Map();
 const spawned = [];
 const workspaces = new Map();
 const httpRoutes = new Map();
 const eventListeners = new Map();
+const modelTools = new Map();
 let workspaceSeq = 0;
 
 // --- fixture: one named set in a fake $DSH_HOME -----------------------------
@@ -73,6 +74,46 @@ function answerGit(argv, cwd) {
 	return { exitCode: 0, stdout: "" };
 }
 
+function versionOf(stat) {
+	return `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeMs}`;
+}
+
+const fakeFs = {
+	async resolve(filePath, options = {}) {
+		if (options.signal?.aborted) throw options.signal.reason;
+		const absolute = path.resolve(options.cwd ?? process.cwd(), filePath);
+		return { targetKey: absolute, displayPath: absolute };
+	},
+	contains(parent, child) {
+		const rel = path.relative(parent.targetKey, child.targetKey);
+		return rel === "" || (!rel.startsWith("..") && !path.isAbsolute(rel));
+	},
+	async stat(target) {
+		const stat = await fs.promises.stat(target.targetKey).catch((error) => error.code === "ENOENT" ? undefined : Promise.reject(error));
+		if (stat === undefined) return undefined;
+		return { version: versionOf(stat), type: stat.isFile() ? "file" : stat.isDirectory() ? "directory" : "other", size: stat.isFile() ? stat.size : undefined };
+	},
+	async readText(target) { return fs.promises.readFile(target.targetKey, "utf8"); },
+	async writeText(target, content, intent) {
+		const beforeStat = await this.stat(target);
+		if (intent?.kind === "createIfAbsent" && beforeStat !== undefined) throw new Error("stale create");
+		if (intent?.kind === "replaceIfVersion" && beforeStat?.version !== intent.version) throw new Error("stale replace");
+		const before = beforeStat === undefined ? null : await this.readText(target);
+		await fs.promises.writeFile(target.targetKey, content, "utf8");
+		return { operation: beforeStat === undefined ? "create" : "update", version: versionOf(await fs.promises.stat(target.targetKey)), before, after: content };
+	},
+	async editText(target, edit, expected) {
+		const stat = await this.stat(target);
+		if (stat === undefined || (expected !== undefined && stat.version !== expected.version)) throw new Error("stale edit");
+		const before = await this.readText(target);
+		const count = before.split(edit.oldString).length - 1;
+		if (count === 0 || (!edit.replaceAll && count !== 1)) throw new Error("bad edit");
+		const after = edit.replaceAll ? before.split(edit.oldString).join(edit.newString) : before.replace(edit.oldString, edit.newString);
+		await fs.promises.writeFile(target.targetKey, after, "utf8");
+		return { version: versionOf(await fs.promises.stat(target.targetKey)), before, after };
+	}
+};
+
 const ctx = {
 	subprocess: {
 		spawn(spec) {
@@ -88,6 +129,7 @@ const ctx = {
 		}
 	},
 	workspaceRegistry: fakeRegistry,
+	fs: fakeFs,
 	webServer: {
 		register(route) {
 			httpRoutes.set(route.path, route);
@@ -99,6 +141,13 @@ const ctx = {
 			if (commands.has(definition.name)) throw new Error(`duplicate command: ${definition.name}`);
 			commands.set(definition.name, definition);
 			return () => commands.delete(definition.name);
+		}
+	},
+	tools: {
+		register(definition) {
+			if (modelTools.has(definition.name)) throw new Error(`duplicate tool: ${definition.name}`);
+			modelTools.set(definition.name, definition);
+			return () => modelTools.delete(definition.name);
 		}
 	},
 	provide(name, value) { ctx[name] = value; },
@@ -135,6 +184,7 @@ console.log("command surface");
 const worktree = commands.get("worktree");
 check("/worktree registered", worktree !== undefined);
 check("service provided as ctx.worktreeFlow", ctx.worktreeFlow !== undefined);
+check("scoped shared docs write/edit tools registered", modelTools.has("worktree_docs_write") && modelTools.has("worktree_docs_edit"));
 
 const invocation = (rawInput) => ({ rawInput, signal: new AbortController().signal, agent: { session: { header: { cwd: repoRoot } } } });
 
@@ -331,22 +381,11 @@ console.log("context note");
 const preStep = eventListeners.get("agent/pre-step");
 check("agent/pre-step hook registered", typeof preStep === "function");
 const featureRootForNote = join(worktreeRoot, "demo", "selection-v2");
-const noteDocsPath = docsSnapshotPath(featureRootForNote);
-mkdirSync(noteDocsPath, { recursive: true });
-writeFileSync(join(noteDocsPath, "guide.md"), "guide\n");
 await writeFeatureContext({
 	version: 1,
 	projectName: "demo",
 	feature: "selection-v2",
 	sessionInstructions: "本分支 SQL 放在 backend/sql/selection-v2。",
-	docsSnapshot: {
-		state: "ready",
-		sourcePath: sharedDocsRoot,
-		path: noteDocsPath,
-		createdAt: new Date().toISOString(),
-		fileCount: 1,
-		bytes: 6
-	},
 	createdAt: new Date().toISOString()
 }, featureRootForNote);
 const featureInstructionsGet = fakeRes();
@@ -377,7 +416,29 @@ check("first step in a feature root injects the identity note", noted.messages.l
 check("note resolves the component display name from the set config", noted.messages[0].content[0].text.includes("backend（后端）"), JSON.stringify(noted.messages));
 check("note injects live project instructions", noted.messages[0].content[0].text.includes("项目统一使用 UTC 时间，并先阅读共享 docs。") && noted.messages[0].content[0].text.includes("项目会话说明"), JSON.stringify(noted.messages));
 check("note injects edited trusted feature-specific instructions", noted.messages[0].content[0].text.includes("编辑后的功能区说明：SQL 在 backend/sql/selection-v3。") && noted.messages[0].content[0].text.includes("功能区自定义说明"), JSON.stringify(noted.messages));
-check("note injects the sandbox-local docs snapshot path", noted.messages[0].content[0].text.includes(noteDocsPath) && !noted.messages[0].content[0].text.includes(`项目共享文档快照：${sharedDocsRoot}`), JSON.stringify(noted.messages));
+check("note injects the live shared docs source", noted.messages[0].content[0].text.includes(`项目共享 docs 原始目录：${sharedDocsRoot}`) && noted.messages[0].content[0].text.includes("worktree_docs_edit"), JSON.stringify(noted.messages));
+const docsExec = { agent: { session: { header: { cwd: featureRootForNote } } } };
+const docsWritten = await modelTools.get("worktree_docs_write").execute({ path: "guide.md", content: "live docs\n" }, docsExec);
+check("shared docs write tool updates the original directory", docsWritten.created === false && readFileSync(join(sharedDocsRoot, "guide.md"), "utf8") === "live docs\n", JSON.stringify(docsWritten));
+const docsEdited = await modelTools.get("worktree_docs_edit").execute({ path: "guide.md", old_string: "live", new_string: "shared" }, docsExec);
+check("shared docs edit tool updates the same original file", docsEdited.replacements === 1 && readFileSync(join(sharedDocsRoot, "guide.md"), "utf8") === "shared docs\n", JSON.stringify(docsEdited));
+mkdirSync(join(sharedDocsRoot, "design"));
+const nestedDocs = await modelTools.get("worktree_docs_write").execute({ path: "design/new.md", content: "new\n" }, docsExec);
+check("shared docs write tool creates a file in an existing subdirectory", nestedDocs.created === true && readFileSync(join(sharedDocsRoot, "design", "new.md"), "utf8") === "new\n", JSON.stringify(nestedDocs));
+let traversalRejected = false;
+try {
+	await modelTools.get("worktree_docs_write").execute({ path: "../escape.md", content: "no" }, docsExec);
+} catch (error) {
+	traversalRejected = error?.code === "BAD_DOCS_PATH";
+}
+check("shared docs tools reject traversal outside the configured root", traversalRejected);
+let outsideFeatureRejected = false;
+try {
+	await modelTools.get("worktree_docs_write").execute({ path: "guide.md", content: "no" }, { agent: { session: { header: { cwd: repoRoot } } } });
+} catch (error) {
+	outsideFeatureRejected = error?.code === "NO_FEATURE";
+}
+check("shared docs tools reject sessions outside a feature workspace", outsideFeatureRejected);
 check("note carries plugin provenance", noted.messages[0]?.source?.plugin === "worktree-flow" && noted.messages[0]?.role === "user");
 const notedTwice = await preStep({ agent: noteAgent, signal: new AbortController().signal }, nextEnter);
 check("note fires once per session", notedTwice.messages.length === 0);
