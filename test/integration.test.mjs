@@ -221,6 +221,39 @@ test("componentGitStatus reports non-zero safety reads instead of failing open",
 	assert.match(status.readError ?? "", /无法读取当前分支|无法读取工作区状态/u);
 });
 
+test("componentGitStatus compares with the base branch's configured remote upstream", async (t) => {
+	const scratch = await fs.promises.mkdtemp(path.join(os.tmpdir(), "dsh-wf-remote-base-"));
+	t.after(() => fs.promises.rm(scratch, { recursive: true, force: true }));
+	const remote = path.join(scratch, "remote.git");
+	const source = path.join(scratch, "source");
+	const peer = path.join(scratch, "peer");
+	const featurePath = path.join(scratch, "feature");
+	await run(scratch, ["init", "--bare", "-b", "master", remote]);
+	await initRepo(source);
+	await run(source, ["remote", "add", "upstream", remote]);
+	await run(source, ["push", "-u", "upstream", "master"]);
+	await run(source, ["worktree", "add", "-b", "feature/remote-base", featurePath, "master"]);
+	await fs.promises.writeFile(path.join(featurePath, "feature.txt"), "feature\n");
+	await run(featurePath, ["add", "feature.txt"]);
+	await run(featurePath, ["-c", "user.name=T", "-c", "user.email=t@example.com", "commit", "-m", "feature"]);
+
+	await run(scratch, ["clone", remote, peer]);
+	await fs.promises.writeFile(path.join(peer, "remote.txt"), "remote\n");
+	await run(peer, ["add", "remote.txt"]);
+	await run(peer, ["-c", "user.name=T", "-c", "user.email=t@example.com", "commit", "-m", "remote"]);
+	await run(peer, ["push", "origin", "master"]);
+	await run(source, ["fetch", "upstream"]);
+	assert.notEqual(await run(source, ["rev-parse", "master"]), await run(source, ["rev-parse", "upstream/master"]));
+
+	const status = await componentGitStatus(fakeCtx(fakeRegistry()), {
+		path: featurePath,
+		expectedBranch: "feature/remote-base",
+		baseBranch: "master"
+	});
+	assert.equal(status.ahead, 1);
+	assert.equal(status.behind, 1, "the fetched remote base, not stale local master, drives comparison");
+});
+
 test("getSet/listSets/resolveForCwd: the set model surface", async (t) => {
 	const { scratch, backendRepo, worktreeRoot, service } = await setup(t);
 
